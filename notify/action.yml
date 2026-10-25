@@ -1,0 +1,80 @@
+name: "Telegram Notify"
+description: >-
+  Send a GitHub event notification to Telegram. Renders one of the built-in
+  HTML templates (workflow, issue, project) from a JSON payload, or sends a
+  raw custom message. Pure-stdlib renderer — no third-party dependencies.
+
+inputs:
+  template:
+    description: "Built-in template to render: workflow, issue, pull_request, push, release, project, or custom"
+    required: true
+  payload:
+    description: "JSON payload consumed by the selected template, e.g. toJSON(github.event.workflow_run)"
+    required: false
+    default: "{}"
+  message:
+    description: "Markdown message for template=custom — converted to Telegram-safe HTML (raw HTML tags are escaped)"
+    required: false
+    default: ""
+  thread_id:
+    description: "Optional Telegram forum topic (message_thread_id)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Render message
+      shell: bash
+      env:
+        TEMPLATE_NAME: ${{ inputs.template }}
+        PAYLOAD_JSON: ${{ inputs.payload }}
+        CUSTOM_MESSAGE: ${{ inputs.message }}
+      run: python3 "${{ github.action_path }}/notify.py"
+
+    - name: Send Telegram message
+      shell: bash
+      env:
+        TELEGRAM_THREAD_ID: ${{ inputs.thread_id }}
+      run: |
+        set -euo pipefail
+
+        # Secrets are passed by the caller via `env:` on the `uses:` step;
+        # they are inherited by every step of this composite action.
+        token="${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required (pass it via env on the uses step)}"
+        chat_id="${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID is required (pass it via env on the uses step)}"
+
+        msg_file="${RUNNER_TEMP:-/tmp}/telegram-message.html"
+        if [[ ! -s "${msg_file}" ]]; then
+          echo "::error::Rendered message not found at ${msg_file}" >&2
+          exit 1
+        fi
+
+        args=(
+          --silent
+          --show-error
+          --fail-with-body
+          --connect-timeout 10
+          --max-time 30
+          --retry 2
+          --retry-all-errors
+          --request POST
+          "https://api.telegram.org/bot${token}/sendMessage"
+          --data-urlencode "chat_id=${chat_id}"
+          --data-urlencode "text@${msg_file}"
+          --data-urlencode "parse_mode=HTML"
+          --data-urlencode "link_preview_options={\"is_disabled\":true}"
+        )
+
+        if [[ -n "${TELEGRAM_THREAD_ID:-}" ]]; then
+          if [[ ! "${TELEGRAM_THREAD_ID}" =~ ^-?[0-9]+$ ]]; then
+            echo "::error::thread_id input must be a numeric message thread ID" >&2
+            exit 1
+          fi
+          args+=(--data-urlencode "message_thread_id=${TELEGRAM_THREAD_ID}")
+        fi
+
+        # The Telegram Bot API requires the token in the URL path. GitHub
+        # automatically masks secret values in logs; the API response never
+        # echoes the token, so --fail-with-body is safe for debugging.
+        curl "${args[@]}"
